@@ -4,6 +4,7 @@ from core.analytics.api import (
     chatbot_trends,
     chatbot_top_queries,
     chatbot_gaps,
+    chatbot_export,
 )
 
 urlpatterns = [
@@ -11,4 +12,5 @@ urlpatterns = [
     path("analytics/chatbots/<uuid:chatbot_id>/trends", chatbot_trends, name="analytics-chatbot-trends"),
     path("analytics/chatbots/<uuid:chatbot_id>/top-queries", chatbot_top_queries, name="analytics-chatbot-top-queries"),
     path("analytics/chatbots/<uuid:chatbot_id>/gaps", chatbot_gaps, name="analytics-chatbot-gaps"),
+    path("analytics/chatbots/<uuid:chatbot_id>/export", chatbot_export, name="analytics-chatbot-export"),
 ]

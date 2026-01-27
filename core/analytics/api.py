@@ -527,3 +527,223 @@ def chatbot_gaps(request, chatbot_id: str):
             "unanswered_queries": items,
         }
     )
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def chatbot_export(request, chatbot_id: str):
+    """
+    GET /v1/analytics/chatbots/{chatbot_id}/export?days=30&limit=20
+
+    Returns a single JSON blob:
+      - summary metrics
+      - trends series
+      - top queries + unanswered
+      - gaps (unanswered queries + example conversation ids)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "analytics_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Analytics is not enabled for this tenant"}},
+            status=403,
+        )
+
+    bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not bot:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Chatbot not found"}}, status=404)
+
+    try:
+        days = int(request.query_params.get("days") or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(90, days))
+
+    try:
+        limit = int(request.query_params.get("limit") or 20)
+    except Exception:
+        limit = 20
+    limit = max(1, min(100, limit))
+
+    now = timezone.now()
+    start = now - timedelta(days=days - 1)
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Conversations in range
+    conv_qs = Conversation.objects.filter(
+        tenant_id=tenant_id,
+        chatbot_id=chatbot_id,
+        updated_at__gte=start,
+        updated_at__lte=now,
+    )
+
+    conv_ids = list(conv_qs.values_list("id", flat=True))
+    conversations_total = len(conv_ids)
+
+    msg_qs = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation_id__in=conv_ids,
+        created_at__gte=start,
+        created_at__lte=now,
+    ) if conv_ids else Message.objects.none()
+
+    messages_total = msg_qs.count()
+    assistant_qs = msg_qs.filter(role=Message.Role.ASSISTANT)
+    user_qs = msg_qs.filter(role=Message.Role.USER)
+
+    assistant_messages_total = assistant_qs.count()
+    kb_used_true = assistant_qs.filter(meta_json__kb_used=True).count()
+    kb_used_false = assistant_qs.filter(Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True)).count()
+
+    kb_hit_rate = round((kb_used_true / assistant_messages_total), 4) if assistant_messages_total else 0.0
+    unanswered_rate = round((kb_used_false / assistant_messages_total), 4) if assistant_messages_total else 0.0
+
+    # Trends (dense daily series)
+    # Conversations: updated_at buckets; Messages: created_at buckets
+    from django.db.models.functions import TruncDate
+    from django.db.models import Count
+
+    conv_buckets = (
+        conv_qs.annotate(day=TruncDate("updated_at"))
+        .values("day")
+        .annotate(conversations_count=Count("id"))
+        .order_by("day")
+    )
+    conv_map = {str(x["day"]): int(x["conversations_count"]) for x in conv_buckets}
+
+    msg_base = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation__tenant_id=tenant_id,
+        conversation__chatbot_id=chatbot_id,
+        created_at__gte=start,
+        created_at__lte=now,
+    ).select_related("conversation")
+
+    user_buckets = (
+        msg_base.filter(role=Message.Role.USER)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    user_map = {str(x["day"]): int(x["cnt"]) for x in user_buckets}
+
+    assistant_buckets = (
+        msg_base.filter(role=Message.Role.ASSISTANT)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    assistant_map = {str(x["day"]): int(x["cnt"]) for x in assistant_buckets}
+
+    kb_true_buckets = (
+        msg_base.filter(role=Message.Role.ASSISTANT, meta_json__kb_used=True)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    kb_true_map = {str(x["day"]): int(x["cnt"]) for x in kb_true_buckets}
+
+    series = []
+    for i in range(days):
+        d = (start + timedelta(days=i)).date()
+        key = str(d)
+
+        conversations_count = conv_map.get(key, 0)
+        user_messages_count = user_map.get(key, 0)
+        assistant_messages_count = assistant_map.get(key, 0)
+        kb_true = kb_true_map.get(key, 0)
+
+        day_kb_hit_rate = round((kb_true / assistant_messages_count), 4) if assistant_messages_count else 0.0
+
+        series.append(
+            {
+                "day": key,
+                "conversations_count": conversations_count,
+                "user_messages_count": user_messages_count,
+                "assistant_messages_count": assistant_messages_count,
+                "kb_hit_rate": day_kb_hit_rate,
+            }
+        )
+
+    # Top queries
+    counts = {}
+    for m in user_qs.exclude(content__isnull=True).exclude(content__exact="").only("content"):
+        q = (m.content or "").strip()
+        if not q:
+            continue
+        if len(q) > 2000:
+            q = q[:2000]
+        counts[q] = counts.get(q, 0) + 1
+
+    top_queries = sorted(
+        [{"query": k, "count": v} for k, v in counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:limit]
+
+    # Unanswered conversations + gaps
+    unanswered_conv_ids = set(
+        assistant_qs.filter(Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True))
+        .values_list("conversation_id", flat=True)
+        .distinct()
+    )
+
+    # Unanswered top queries + gaps examples
+    ucounts = {}
+    examples = {}
+    if unanswered_conv_ids:
+        unanswered_user_msgs = user_qs.filter(conversation_id__in=list(unanswered_conv_ids)).exclude(content__isnull=True).exclude(content__exact="")
+        for m in unanswered_user_msgs.only("content", "conversation_id"):
+            q = (m.content or "").strip()
+            if not q:
+                continue
+            if len(q) > 2000:
+                q = q[:2000]
+
+            ucounts[q] = ucounts.get(q, 0) + 1
+            if q not in examples:
+                examples[q] = set()
+            if len(examples[q]) < 3:
+                examples[q].add(str(m.conversation_id))
+
+    top_unanswered_queries = sorted(
+        [{"query": k, "count": v} for k, v in ucounts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:limit]
+
+    gaps = sorted(
+        [{"query": k, "count": v, "examples": sorted(list(examples.get(k, [])))} for k, v in ucounts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:limit]
+
+    return Response(
+        {
+            "chatbot_id": str(bot.id),
+            "tenant_id": str(tenant_id),
+            "days": days,
+            "range": {"from": start.isoformat(), "to": now.isoformat()},
+            "summary": {
+                "conversations_total": conversations_total,
+                "messages_total": messages_total,
+                "assistant_messages_total": assistant_messages_total,
+                "kb_hit_rate": kb_hit_rate,
+                "unanswered_rate": unanswered_rate,
+            },
+            "trends": {
+                "series": series,
+            },
+            "top_queries": {
+                "top_queries": top_queries,
+                "top_unanswered_queries": top_unanswered_queries,
+            },
+            "gaps": {
+                "unanswered_queries": gaps,
+            },
+        }
+    )
