@@ -204,6 +204,10 @@ class PublicChatView(APIView):
                 status=422,
             )
 
+        # default so msg_meta always has a defined value
+        chunks = []
+        citations = []
+
         with transaction.atomic():
             conv = None
             conv_id = data.get("conversation_id")
@@ -237,6 +241,7 @@ class PublicChatView(APIView):
                     "Please try again in a moment after your content finishes processing."
                 )
                 citations = []
+                chunks = []
             else:
                 chunks = search_knowledge_chunks(
                     tenant_id=str(tenant_id),
@@ -264,9 +269,27 @@ class PublicChatView(APIView):
 
                     citations = _top_citations(chunks, max_sources=3)
 
-            msg_meta = {"placeholder": False}
+            # ---- analytics-ready retrieval metadata (NEW) ----
+            top_score = 0.0
+            if chunks:
+                try:
+                    top_score = float(getattr(chunks[0], "score", 0.0) or 0.0)
+                except Exception:
+                    top_score = 0.0
+
+            source_ids = []
+            if citations:
+                source_ids = [c.get("source_id") for c in citations if c.get("source_id")]
+
+            msg_meta = {
+                "placeholder": False,
+                "kb_used": bool(chunks),
+                "kb_top_score": round(top_score, 3),
+                "kb_source_ids": source_ids,
+            }
             if bot.citations_enabled:
                 msg_meta["citations"] = citations
+            # -----------------------------------------------
 
             Message.objects.create(
                 tenant_id=tenant_id,
