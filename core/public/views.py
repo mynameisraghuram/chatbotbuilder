@@ -242,6 +242,7 @@ class PublicChatView(APIView):
                     tenant_id=str(tenant_id),
                     query=user_message,
                     top_k=8,
+                    min_score=0.8,
                 )
                 chunks = _dedupe_chunks(chunks)
 
