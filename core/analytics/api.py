@@ -406,3 +406,124 @@ def chatbot_top_queries(request, chatbot_id: str):
             "top_unanswered_queries": top_unanswered,
         }
     )
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def chatbot_gaps(request, chatbot_id: str):
+    """
+    GET /v1/analytics/chatbots/{chatbot_id}/gaps?days=30&limit=20
+
+    "Gap" = user questions in conversations where the assistant did NOT use KB
+            (meta_json.kb_used == false OR missing/null)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "analytics_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Analytics is not enabled for this tenant"}},
+            status=403,
+        )
+
+    bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not bot:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Chatbot not found"}}, status=404)
+
+    try:
+        days = int(request.query_params.get("days") or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(90, days))
+
+    try:
+        limit = int(request.query_params.get("limit") or 20)
+    except Exception:
+        limit = 20
+    limit = max(1, min(100, limit))
+
+    now = timezone.now()
+    start = now - timedelta(days=days - 1)
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Conversations in range (activity-based)
+    conv_ids = list(
+        Conversation.objects.filter(
+            tenant_id=tenant_id,
+            chatbot_id=chatbot_id,
+            updated_at__gte=start,
+            updated_at__lte=now,
+        ).values_list("id", flat=True)
+    )
+
+    if not conv_ids:
+        return Response(
+            {
+                "chatbot_id": str(bot.id),
+                "tenant_id": str(tenant_id),
+                "days": days,
+                "unanswered_queries": [],
+            }
+        )
+
+    msg_qs = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation_id__in=conv_ids,
+        created_at__gte=start,
+        created_at__lte=now,
+    )
+
+    unanswered_conv_ids = set(
+        msg_qs.filter(role=Message.Role.ASSISTANT)
+        .filter(Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True))
+        .values_list("conversation_id", flat=True)
+        .distinct()
+    )
+
+    if not unanswered_conv_ids:
+        return Response(
+            {
+                "chatbot_id": str(bot.id),
+                "tenant_id": str(tenant_id),
+                "days": days,
+                "unanswered_queries": [],
+            }
+        )
+
+    user_msgs = (
+        msg_qs.filter(role=Message.Role.USER, conversation_id__in=list(unanswered_conv_ids))
+        .exclude(content__isnull=True)
+        .exclude(content__exact="")
+    )
+
+    # Aggregate in python to stay DB-portable
+    counts = {}
+    examples = {}  # query -> set(conversation_id)
+
+    for m in user_msgs.only("content", "conversation_id"):
+        q = (m.content or "").strip()
+        if not q:
+            continue
+        if len(q) > 2000:
+            q = q[:2000]
+
+        counts[q] = counts.get(q, 0) + 1
+        if q not in examples:
+            examples[q] = set()
+        if len(examples[q]) < 3:
+            examples[q].add(str(m.conversation_id))
+
+    items = sorted(
+        [{"query": k, "count": v, "examples": sorted(list(examples.get(k, [])))} for k, v in counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:limit]
+
+    return Response(
+        {
+            "chatbot_id": str(bot.id),
+            "tenant_id": str(tenant_id),
+            "days": days,
+            "unanswered_queries": items,
+        }
+    )
