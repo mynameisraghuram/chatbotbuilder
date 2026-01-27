@@ -1,7 +1,8 @@
 from django.urls import path
-from core.analytics.api import chatbot_analytics, chatbot_trends
+from core.analytics.api import chatbot_analytics, chatbot_trends, chatbot_top_queries
 
 urlpatterns = [
     path("analytics/chatbots/<uuid:chatbot_id>", chatbot_analytics, name="analytics-chatbot"),
     path("analytics/chatbots/<uuid:chatbot_id>/trends", chatbot_trends, name="analytics-chatbot-trends"),
+    path("analytics/chatbots/<uuid:chatbot_id>/top-queries", chatbot_top_queries, name="analytics-chatbot-top-queries"),
 ]
