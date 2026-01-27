@@ -28,5 +28,6 @@ urlpatterns = [
     path("v1/", include("core.public.urls")),
     path("v1/", include("core.leads.urls")),
     path("v1/", include("core.analytics.urls")),
+    path("v1/", include("core.conversations.urls")),
 
 ]
