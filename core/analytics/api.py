@@ -1,0 +1,160 @@
+from datetime import datetime, timedelta
+from django.db.models import Q
+from django.utils import timezone
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from core.common.flags import is_enabled
+from core.iam.models import TenantMembership
+from core.chatbots.models import Chatbot
+from core.conversations.models import Conversation, Message
+
+
+def _require_tenant_and_member(request):
+    tenant_id = getattr(request, "tenant_id", None)
+    if not tenant_id:
+        return None, None, Response(
+            {"error": {"code": "TENANT_REQUIRED", "message": "X-Tenant-Id header is required"}},
+            status=400,
+        )
+
+    member = TenantMembership.objects.filter(tenant_id=tenant_id, user_id=request.user.id).first()
+    if not member:
+        return tenant_id, None, Response(
+            {"error": {"code": "FORBIDDEN", "message": "User is not a member of this tenant"}},
+            status=403,
+        )
+    return tenant_id, member, None
+
+
+def _parse_dt(s: str):
+    # Accept: YYYY-MM-DD
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def chatbot_analytics(request, chatbot_id: str):
+    """
+    GET /v1/analytics/chatbots/{chatbot_id}?from=YYYY-MM-DD&to=YYYY-MM-DD
+
+    Returns:
+      - conversations_total
+      - messages_total
+      - assistant_messages_total
+      - kb_hit_rate (assistant messages with meta_json.kb_used == true)
+      - unanswered_rate (assistant messages with kb_used == false)
+      - top_unanswered_queries (top user messages that led to kb_used == false)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "analytics_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Analytics is not enabled for this tenant"}},
+            status=403,
+        )
+
+    bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not bot:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Chatbot not found"}}, status=404)
+
+    # Date range (defaults: last 7 days)
+    now = timezone.now()
+    from_s = (request.query_params.get("from") or "").strip()
+    to_s = (request.query_params.get("to") or "").strip()
+
+    dt_from = _parse_dt(from_s)
+    dt_to = _parse_dt(to_s)
+
+    if dt_from:
+        start = timezone.make_aware(datetime(dt_from.year, dt_from.month, dt_from.day, 0, 0, 0))
+    else:
+        start = now - timedelta(days=7)
+
+    if dt_to:
+        # inclusive end-of-day
+        end = timezone.make_aware(datetime(dt_to.year, dt_to.month, dt_to.day, 23, 59, 59))
+    else:
+        end = now
+
+    # Conversations in range (by updated_at so activity counts)
+    conv_qs = Conversation.objects.filter(
+        tenant_id=tenant_id,
+        chatbot_id=chatbot_id,
+        updated_at__gte=start,
+        updated_at__lte=end,
+    )
+
+    conversations_total = conv_qs.count()
+
+    # Messages in those conversations
+    msg_qs = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation_id__in=conv_qs.values_list("id", flat=True),
+    )
+
+    messages_total = msg_qs.count()
+
+    assistant_qs = msg_qs.filter(role=Message.Role.ASSISTANT)
+    assistant_messages_total = assistant_qs.count()
+
+    # kb_used stored in meta_json by your PublicChatView patch
+    kb_used_true = assistant_qs.filter(meta_json__kb_used=True).count()
+    kb_used_false = assistant_qs.filter(
+        Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True)
+    ).count()
+
+    kb_hit_rate = round((kb_used_true / assistant_messages_total), 4) if assistant_messages_total else 0.0
+    unanswered_rate = round((kb_used_false / assistant_messages_total), 4) if assistant_messages_total else 0.0
+
+    # Top unanswered user queries:
+    # Find assistant messages with kb_used false, take their conversation + nearest previous user msg.
+    # Simple heuristic: any user message in those conversations within range; group by content.
+    # (Good enough for MVP; we can tighten later with message ordering.)
+    unanswered_conv_ids = assistant_qs.filter(
+        Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True)
+    ).values_list("conversation_id", flat=True).distinct()
+
+    user_qs = msg_qs.filter(
+        role=Message.Role.USER,
+        conversation_id__in=unanswered_conv_ids,
+    ).exclude(content__isnull=True).exclude(content__exact="")
+
+    # group in python (portable, no DB-specific JSON ops)
+    counts = {}
+    for m in user_qs.only("content"):
+        key = (m.content or "").strip()
+        if not key:
+            continue
+        if len(key) > 2000:
+            key = key[:2000]
+        counts[key] = counts.get(key, 0) + 1
+
+    top_unanswered = sorted(
+        [{"query": k, "count": v} for k, v in counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:10]
+
+    return Response(
+        {
+            "chatbot_id": str(bot.id),
+            "tenant_id": str(tenant_id),
+            "range": {"from": start.isoformat(), "to": end.isoformat()},
+            "metrics": {
+                "conversations_total": conversations_total,
+                "messages_total": messages_total,
+                "assistant_messages_total": assistant_messages_total,
+                "kb_hit_rate": kb_hit_rate,
+                "unanswered_rate": unanswered_rate,
+            },
+            "top_unanswered_queries": top_unanswered,
+        }
+    )
