@@ -23,4 +23,8 @@ urlpatterns = [
     path("v1/", include("core.iam.urls")),
     path("v1/", include("core.search.urls")),
     path("v1/", include("core.knowledge.urls")),
+    path("v1/", include("core.chatbots.urls")),
+    path("v1/", include("core.api_keys.urls")),
+    path("v1/", include("core.public.urls")),
+    path("v1/", include("core.leads.urls")),
 ]
