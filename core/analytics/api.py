@@ -11,7 +11,8 @@ from core.iam.models import TenantMembership
 from core.chatbots.models import Chatbot
 from core.conversations.models import Conversation, Message
 
-
+from django.db.models.functions import TruncDate
+from django.db.models import Count
 def _require_tenant_and_member(request):
     tenant_id = getattr(request, "tenant_id", None)
     if not tenant_id:
@@ -156,5 +157,128 @@ def chatbot_analytics(request, chatbot_id: str):
                 "unanswered_rate": unanswered_rate,
             },
             "top_unanswered_queries": top_unanswered,
+        }
+    )
+
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def chatbot_trends(request, chatbot_id: str):
+    """
+    GET /v1/analytics/chatbots/{chatbot_id}/trends?days=30
+
+    Returns daily buckets:
+      - conversations_count
+      - user_messages_count
+      - assistant_messages_count
+      - kb_hit_rate (assistant meta_json.kb_used == true / assistant messages)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "analytics_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Analytics is not enabled for this tenant"}},
+            status=403,
+        )
+
+    bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not bot:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Chatbot not found"}}, status=404)
+
+    try:
+        days = int(request.query_params.get("days") or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(90, days))
+
+    now = timezone.now()
+    start = now - timedelta(days=days - 1)
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Conversations bucketed by updated_at date
+    conv_buckets = (
+        Conversation.objects.filter(
+            tenant_id=tenant_id,
+            chatbot_id=chatbot_id,
+            updated_at__gte=start,
+            updated_at__lte=now,
+        )
+        .annotate(day=TruncDate("updated_at"))
+        .values("day")
+        .annotate(conversations_count=Count("id"))
+        .order_by("day")
+    )
+    conv_map = {str(x["day"]): int(x["conversations_count"]) for x in conv_buckets}
+
+    # Messages bucketed by created_at date (more accurate for volume)
+    msg_base = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation__tenant_id=tenant_id,
+        conversation__chatbot_id=chatbot_id,
+        created_at__gte=start,
+        created_at__lte=now,
+    ).select_related("conversation")
+
+    user_buckets = (
+        msg_base.filter(role=Message.Role.USER)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    user_map = {str(x["day"]): int(x["cnt"]) for x in user_buckets}
+
+    assistant_buckets = (
+        msg_base.filter(role=Message.Role.ASSISTANT)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    assistant_map = {str(x["day"]): int(x["cnt"]) for x in assistant_buckets}
+
+    assistant_kb_true_buckets = (
+        msg_base.filter(role=Message.Role.ASSISTANT, meta_json__kb_used=True)
+        .annotate(day=TruncDate("created_at"))
+        .values("day")
+        .annotate(cnt=Count("id"))
+        .order_by("day")
+    )
+    kb_true_map = {str(x["day"]): int(x["cnt"]) for x in assistant_kb_true_buckets}
+
+    # Build dense series for last N days (including zeros)
+    series = []
+    for i in range(days):
+        d = (start + timedelta(days=i)).date()
+        key = str(d)
+
+        conversations_count = conv_map.get(key, 0)
+        user_messages_count = user_map.get(key, 0)
+        assistant_messages_count = assistant_map.get(key, 0)
+        kb_true = kb_true_map.get(key, 0)
+
+        kb_hit_rate = round((kb_true / assistant_messages_count), 4) if assistant_messages_count else 0.0
+
+        series.append(
+            {
+                "day": key,
+                "conversations_count": conversations_count,
+                "user_messages_count": user_messages_count,
+                "assistant_messages_count": assistant_messages_count,
+                "kb_hit_rate": kb_hit_rate,
+            }
+        )
+
+    return Response(
+        {
+            "chatbot_id": str(bot.id),
+            "tenant_id": str(tenant_id),
+            "days": days,
+            "from": start.date().isoformat(),
+            "to": now.date().isoformat(),
+            "series": series,
         }
     )
