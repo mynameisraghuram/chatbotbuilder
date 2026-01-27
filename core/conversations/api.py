@@ -1,5 +1,6 @@
 from datetime import timedelta
 from django.utils import timezone
+from django.db.models import Exists, OuterRef, Q
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -7,7 +8,7 @@ from rest_framework.response import Response
 
 from core.common.flags import is_enabled
 from core.iam.models import TenantMembership
-from core.conversations.models import Conversation
+from core.conversations.models import Conversation, Message
 from core.conversations.serializers import ConversationListSerializer, ConversationDetailSerializer
 
 
@@ -29,11 +30,22 @@ def _require_tenant_and_member(request):
     return tenant_id, member, None
 
 
+def _can_view_pii(member: TenantMembership) -> bool:
+    return member.role in (
+        TenantMembership.ROLE_OWNER,
+        TenantMembership.ROLE_ADMIN,
+    )
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def conversations_list(request):
     """
-    GET /v1/conversations?chatbot_id=<uuid>&days=30&limit=20&offset=0
+    GET /v1/conversations?chatbot_id=<uuid>&days=30&limit=20&offset=0&kb_used=true|false|any&include_pii=true
+
+    Notes:
+      - include_pii only for OWNER/ADMIN; otherwise ignored.
+      - kb_used filter checks assistant messages in the same conversation.
     """
     tenant_id, member, err = _require_tenant_and_member(request)
     if err:
@@ -67,6 +79,16 @@ def conversations_list(request):
         offset = 0
     offset = max(0, offset)
 
+    kb_used = (request.query_params.get("kb_used") or "any").strip().lower()
+    if kb_used not in ("true", "false", "any"):
+        return Response(
+            {"error": {"code": "VALIDATION_ERROR", "message": "kb_used must be one of: true,false,any"}},
+            status=422,
+        )
+
+    include_pii_raw = (request.query_params.get("include_pii") or "").strip().lower()
+    include_pii = (include_pii_raw in ("1", "true", "yes")) and _can_view_pii(member)
+
     now = timezone.now()
     start = now - timedelta(days=days - 1)
     start = start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -76,18 +98,36 @@ def conversations_list(request):
         chatbot_id=chatbot_id,
         updated_at__gte=start,
         updated_at__lte=now,
-    ).order_by("-updated_at")
+    )
+
+    # kb_used filter via EXISTS subquery on assistant messages
+    # (We do not restrict assistant msg timestamps here; it's "conversation had unanswered/answered in this window")
+    assistant_base = Message.objects.filter(
+        tenant_id=tenant_id,
+        conversation_id=OuterRef("id"),
+        role=Message.Role.ASSISTANT,
+    )
+
+    if kb_used == "true":
+        qs = qs.annotate(_kb_true=Exists(assistant_base.filter(meta_json__kb_used=True))).filter(_kb_true=True)
+    elif kb_used == "false":
+        qs = qs.annotate(
+            _kb_false=Exists(
+                assistant_base.filter(Q(meta_json__kb_used=False) | Q(meta_json__kb_used__isnull=True))
+            )
+        ).filter(_kb_false=True)
+
+    qs = qs.order_by("-updated_at")
 
     total = qs.count()
-    page = qs[offset : offset + limit]
+    page = qs[offset: offset + limit]
 
     return Response(
         {
-            "items": ConversationListSerializer(page, many=True).data,
+            "items": ConversationListSerializer(page, many=True, context={"include_pii": include_pii}).data,
             "page": {"limit": limit, "offset": offset, "total": total},
         }
     )
-
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])

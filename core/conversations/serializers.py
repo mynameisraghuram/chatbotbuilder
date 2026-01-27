@@ -16,6 +16,17 @@ class ConversationListSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+
+        include_pii = bool(self.context.get("include_pii", False))
+        if not include_pii:
+            data["external_user_id"] = ""
+            data["session_id"] = ""
+            data["user_email"] = ""
+
+        return data
+
 
 class MessageSerializer(serializers.ModelSerializer):
     class Meta:
