@@ -150,3 +150,114 @@ def conversation_detail(request, conversation_id: str):
         return Response({"error": {"code": "NOT_FOUND", "message": "Conversation not found"}}, status=404)
 
     return Response({"conversation": ConversationDetailSerializer(conv).data})
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def conversations_search(request):
+    """
+    GET /v1/conversations/search?chatbot_id=<uuid>&q=...&days=30&limit=20&offset=0
+
+    Postgres search (icontains) over Message.content.
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "analytics_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Analytics is not enabled for this tenant"}},
+            status=403,
+        )
+
+    chatbot_id = (request.query_params.get("chatbot_id") or "").strip()
+    if not chatbot_id:
+        return Response({"error": {"code": "VALIDATION_ERROR", "message": "chatbot_id is required"}}, status=422)
+
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        return Response({"error": {"code": "VALIDATION_ERROR", "message": "q is required"}}, status=422)
+
+    # guardrail: prevent huge queries
+    if len(q) > 200:
+        q = q[:200]
+
+    try:
+        days = int(request.query_params.get("days") or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(90, days))
+
+    try:
+        limit = int(request.query_params.get("limit") or 20)
+    except Exception:
+        limit = 20
+    limit = max(1, min(50, limit))
+
+    try:
+        offset = int(request.query_params.get("offset") or 0)
+    except Exception:
+        offset = 0
+    offset = max(0, offset)
+
+    now = timezone.now()
+    start = now - timedelta(days=days - 1)
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Only messages for conversations under this tenant + chatbot
+    qs = (
+        Message.objects.filter(
+            tenant_id=tenant_id,
+            conversation__tenant_id=tenant_id,
+            conversation__chatbot_id=chatbot_id,
+            created_at__gte=start,
+            created_at__lte=now,
+        )
+        .exclude(content__isnull=True)
+        .exclude(content__exact="")
+        .filter(content__icontains=q)
+        .select_related("conversation")
+        .order_by("-created_at")
+    )
+
+    total = qs.count()
+    page = qs[offset : offset + limit]
+
+    def _snippet(text: str, needle: str, max_len: int = 220) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        idx = t.lower().find(needle.lower())
+        if idx == -1:
+            return (t[:max_len] + ("…" if len(t) > max_len else ""))
+        start_i = max(0, idx - 60)
+        end_i = min(len(t), idx + len(needle) + 140)
+        s = t[start_i:end_i]
+        if start_i > 0:
+            s = "…" + s
+        if end_i < len(t):
+            s = s + "…"
+        if len(s) > max_len:
+            s = s[:max_len] + "…"
+        return s
+
+    items = []
+    for m in page:
+        items.append(
+            {
+                "conversation_id": str(m.conversation_id),
+                "message_id": str(m.id),
+                "role": m.role,
+                "snippet": _snippet(m.content or "", q),
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+        )
+
+    return Response(
+        {
+            "q": q,
+            "chatbot_id": str(chatbot_id),
+            "days": days,
+            "items": items,
+            "page": {"limit": limit, "offset": offset, "total": total},
+        }
+    )
