@@ -1,3 +1,5 @@
+# repo-root/backend/core/common/middleware.py
+
 import uuid
 from django.conf import settings
 from django.http import JsonResponse
@@ -8,12 +10,13 @@ PUBLIC_PATH_PREFIXES = (
     "/api/docs/",
     "/v1/auth/login",
     "/v1/auth/refresh",
+    "/v1/public/",  # ✅ Public endpoints must not require X-Tenant-Id
 )
 
 class TenantScopeMiddleware:
     """
     Sprint 0:
-    - Require X-Tenant-Id for /v1/* except auth/docs/admin.
+    - Require X-Tenant-Id for /v1/* except auth/docs/admin/public.
     - Parse UUID and attach request.tenant_id.
     - Membership checks are enforced in endpoints/permissions (server-side).
     """
@@ -23,6 +26,7 @@ class TenantScopeMiddleware:
     def __call__(self, request):
         path = request.path or "/"
 
+        # ✅ Skip tenant header requirement for known public paths
         if path.startswith(PUBLIC_PATH_PREFIXES):
             return self.get_response(request)
 
@@ -33,11 +37,17 @@ class TenantScopeMiddleware:
         raw = request.headers.get(header_name)
 
         if not raw:
-            return JsonResponse({"error": {"code": "TENANT_REQUIRED", "message": f"{header_name} header is required"}}, status=400)
+            return JsonResponse(
+                {"error": {"code": "TENANT_REQUIRED", "message": f"{header_name} header is required"}},
+                status=400,
+            )
 
         try:
             request.tenant_id = uuid.UUID(str(raw))
         except Exception:
-            return JsonResponse({"error": {"code": "TENANT_INVALID", "message": f"{header_name} must be a valid UUID"}}, status=400)
+            return JsonResponse(
+                {"error": {"code": "TENANT_INVALID", "message": f"{header_name} must be a valid UUID"}},
+                status=400,
+            )
 
         return self.get_response(request)
