@@ -1,4 +1,8 @@
+# backend/core/public/views.py
+
+import re
 import time
+import hashlib
 from django.db import transaction
 from django.utils import timezone
 
@@ -12,6 +16,98 @@ from core.public.serializers import PublicChatRequestSerializer
 
 from core.chatbots.models import Chatbot
 from core.conversations.models import Conversation, Message
+
+from core.knowledge.readiness import tenant_knowledge_ready
+from core.knowledge.retrieval import search_knowledge_chunks
+
+
+def _clean_text(s: str) -> str:
+    s = s or ""
+    s = s.replace("\x00", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _dedupe_chunks(chunks):
+    """
+    De-dupe by normalized content hash (keeps first/highest-scored ordering).
+    """
+    seen = set()
+    out = []
+    for c in chunks or []:
+        content = _clean_text(getattr(c, "content", "") or "")
+        if not content:
+            continue
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(c)
+    return out
+
+
+def _compose_reply_from_chunks(
+    chunks,
+    *,
+    max_reply_chars: int = 1400,
+    per_chunk_chars: int = 700,
+    max_chunks: int = 3,
+) -> str:
+    """
+    Build a readable reply from top chunks with hard limits.
+    """
+    parts = []
+    total = 0
+
+    for c in (chunks or [])[:max_chunks]:
+        text = _clean_text(getattr(c, "content", "") or "")
+        if not text:
+            continue
+
+        text = text[:per_chunk_chars].strip()
+        if not text:
+            continue
+
+        add = text if not parts else f"\n\n{text}"
+        if total + len(add) > max_reply_chars:
+            remaining = max_reply_chars - total
+            if remaining <= 0:
+                break
+            add = add[:remaining].rstrip()
+            parts.append(add)
+            total += len(add)
+            break
+
+        parts.append(add)
+        total += len(add)
+
+    return "".join(parts).strip()
+
+
+def _top_citations(chunks, *, max_sources: int = 3):
+    """
+    Keep only top N unique sources by first occurrence (already score-ordered).
+    """
+    out = []
+    seen_sources = set()
+
+    for c in chunks or []:
+        sid = str(getattr(c, "source_id", "") or "")
+        if not sid or sid in seen_sources:
+            continue
+        seen_sources.add(sid)
+
+        out.append(
+            {
+                "source_id": sid,
+                "title": _clean_text(str(getattr(c, "title", "") or ""))[:255],
+                "score": round(float(getattr(c, "score", 0.0) or 0.0), 3),
+            }
+        )
+        if len(out) >= max_sources:
+            break
+
+    return out
 
 
 def _rate_limit(request):
@@ -91,8 +187,9 @@ class PublicChatView(APIView):
         tenant_id = getattr(request, "public_tenant_id")
         chatbot_id = getattr(request, "public_chatbot_id")
 
-        # Ensure chatbot exists and is active (avoid leaking)
-        bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+        bot = Chatbot.objects.filter(
+            id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True
+        ).first()
         if not bot or bot.status != Chatbot.Status.ACTIVE:
             return Response(
                 {"error": {"code": "NOT_FOUND", "message": "Chatbot not found", "details": {}}},
@@ -100,14 +197,13 @@ class PublicChatView(APIView):
             )
 
         data = s.validated_data
-        user_message = data["message"].strip()
+        user_message = (data.get("message") or "").strip()
         if not user_message:
             return Response(
                 {"error": {"code": "VALIDATION_ERROR", "message": "message cannot be empty", "details": {}}},
                 status=422,
             )
 
-        # Create or load conversation strictly within tenant+chatbot
         with transaction.atomic():
             conv = None
             conv_id = data.get("conversation_id")
@@ -127,7 +223,6 @@ class PublicChatView(APIView):
                     meta_json=data.get("meta", {}) or {},
                 )
 
-            # Store user message
             Message.objects.create(
                 tenant_id=tenant_id,
                 conversation=conv,
@@ -136,24 +231,55 @@ class PublicChatView(APIView):
                 meta_json={"ts": timezone.now().isoformat()},
             )
 
-            # Placeholder assistant reply (we’ll replace with retrieval + generation later)
-            assistant_text = "Thanks! I’ve received your message. (Next step: connect knowledge search + response.)"
+            if not tenant_knowledge_ready(tenant_id=tenant_id):
+                assistant_text = (
+                    "I’m not ready with your company information yet. "
+                    "Please try again in a moment after your content finishes processing."
+                )
+                citations = []
+            else:
+                chunks = search_knowledge_chunks(
+                    tenant_id=str(tenant_id),
+                    query=user_message,
+                    top_k=8,
+                )
+                chunks = _dedupe_chunks(chunks)
+
+                if not chunks:
+                    assistant_text = (
+                        "I couldn’t find this in your company information yet. "
+                        "Try rephrasing, or add more content to your knowledge base."
+                    )
+                    citations = []
+                else:
+                    assistant_text = _compose_reply_from_chunks(
+                        chunks,
+                        max_reply_chars=1400,
+                        per_chunk_chars=700,
+                        max_chunks=3,
+                    )
+                    if not assistant_text:
+                        assistant_text = "I found related info, but it looks empty. Please try again."
+
+                    citations = _top_citations(chunks, max_sources=3)
+
+            msg_meta = {"placeholder": False}
+            if bot.citations_enabled:
+                msg_meta["citations"] = citations
 
             Message.objects.create(
                 tenant_id=tenant_id,
                 conversation=conv,
                 role=Message.Role.ASSISTANT,
                 content=assistant_text,
-                meta_json={"placeholder": True},
+                meta_json=msg_meta,
             )
 
             conv.updated_at = timezone.now()
             conv.save(update_fields=["updated_at"])
 
-        return Response(
-            {
-                "conversation_id": str(conv.id),
-                "reply": assistant_text,
-            },
-            status=status.HTTP_200_OK,
-        )
+        payload = {"conversation_id": str(conv.id), "reply": assistant_text}
+        if bot.citations_enabled:
+            payload["citations"] = citations
+
+        return Response(payload, status=status.HTTP_200_OK)
