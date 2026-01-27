@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtualenv
+venv/
+.env
+
+# Django
+db.sqlite3
+media/
+staticfiles/
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Celery / Redis
+celerybeat-schedule
