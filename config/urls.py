@@ -31,5 +31,6 @@ urlpatterns = [
     path("v1/", include("core.conversations.urls")),
     path("v1/", include("core.webhooks.urls")),
     path("v1/", include("core.notifications.urls")),
+    path("v1/", include("core.audit.urls")),
 
 ]

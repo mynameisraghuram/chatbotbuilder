@@ -61,8 +61,14 @@ class NotificationEvent(models.Model):
     class Meta:
         db_table = "notification_events"
         indexes = [
-            models.Index(fields=["tenant_id", "user_id", "digested_at", "created_at"], name="notif_evt_tu_digest_created_idx"),
-            models.Index(fields=["tenant_id", "type", "created_at"], name="notif_evt_ttype_created_idx"),
+            models.Index(
+                fields=["tenant_id", "user_id", "digested_at", "created_at"],
+                name="nevt_tu_dg_cr_idx",
+            ),
+            models.Index(
+                fields=["tenant_id", "type", "created_at"],
+                name="nevt_tt_cr_idx",
+            ),
         ]
 
     def mark_digested(self):
