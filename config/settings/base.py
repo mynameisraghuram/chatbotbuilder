@@ -118,3 +118,10 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "Asia/Kolkata"
 CELERY_ENABLE_UTC = True
+
+CELERY_BEAT_SCHEDULE = {
+    "schedule-lead-reminders-every-5-min": {
+        "task": "core.leads.tasks_sla.schedule_lead_reminders",
+        "schedule": 300.0,
+    },
+}

@@ -37,6 +37,9 @@ class Lead(models.Model):
     meta_json = models.JSONField(default=dict, blank=True)
 
     assigned_to_user_id = models.UUIDField(null=True, blank=True, db_index=True)
+    last_contacted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    next_action_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
     updated_at = models.DateTimeField(default=timezone.now, db_index=True)
     deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
@@ -159,3 +162,69 @@ class OtpVerification(models.Model):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+class LeadSlaPolicy(models.Model):
+    """
+    Tenant-level SLA rules for reminders.
+    Example: status 'new' -> remind after 60 mins if not contacted.
+    """
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="lead_sla_policies")
+
+    is_enabled = models.BooleanField(default=True)
+
+    # minutes per status. Example: {"new": 60, "open": 240, "qualified": 1440}
+    minutes_by_status = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "lead_sla_policies"
+        indexes = [
+            models.Index(fields=["tenant", "is_enabled"]),
+        ]
+
+    def touch(self):
+        self.updated_at = timezone.now()
+        self.save(update_fields=["updated_at"])
+
+class LeadReminder(models.Model):
+    class Status(models.TextChoices):
+        SCHEDULED = "scheduled", "Scheduled"
+        SENT = "sent", "Sent"
+        CANCELED = "canceled", "Canceled"
+        FAILED = "failed", "Failed"
+
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="lead_reminders")
+    lead = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="reminders")
+
+    reason = models.CharField(max_length=64, default="sla")  # "sla"
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.SCHEDULED, db_index=True)
+
+    scheduled_for = models.DateTimeField(db_index=True)
+    sent_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    attempts = models.PositiveIntegerField(default=0)
+    last_error = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "lead_reminders"
+        indexes = [
+            models.Index(fields=["tenant", "status", "scheduled_for"]),
+            models.Index(fields=["tenant", "lead", "created_at"]),
+        ]
+        constraints = [
+            # prevent duplicates: one scheduled reminder per lead per scheduled_for minute bucket
+            models.UniqueConstraint(
+                fields=["tenant", "lead", "reason", "scheduled_for"],
+                name="uniq_lead_reminder_per_time",
+            ),
+        ]
+
+    def touch(self):
+        self.updated_at = timezone.now()
+        self.save(update_fields=["updated_at"])
