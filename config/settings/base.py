@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "core.public",
     "core.analytics",
     "core.webhooks",
+    "core.notifications",
 ]
 
 MIDDLEWARE = [

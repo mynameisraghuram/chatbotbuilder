@@ -14,6 +14,9 @@ from core.leads.events import record_lead_event
 from core.webhooks.models import WebhookEndpoint, WebhookDelivery
 from core.webhooks.tasks import deliver_webhook_delivery
 
+from core.notifications.models import NotificationPreference
+
+
 User = get_user_model()
 
 
@@ -33,6 +36,11 @@ def _recipient_user_ids_for_lead(tenant_id, lead) -> list:
     ).values_list("user_id", flat=True)
     return list(qs)
 
+def _email_allowed(tenant_id, user_id) -> bool:
+    pref = NotificationPreference.objects.filter(tenant_id=tenant_id, user_id=user_id).first()
+    if not pref:
+        return True
+    return bool(pref.email_enabled)
 
 @shared_task
 def process_due_lead_reminders():

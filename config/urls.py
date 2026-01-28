@@ -30,5 +30,6 @@ urlpatterns = [
     path("v1/", include("core.analytics.urls")),
     path("v1/", include("core.conversations.urls")),
     path("v1/", include("core.webhooks.urls")),
+    path("v1/", include("core.notifications.urls")),
 
 ]
