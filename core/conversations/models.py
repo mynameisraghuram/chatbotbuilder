@@ -11,6 +11,14 @@ class Conversation(models.Model):
 
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="conversations")
     chatbot = models.ForeignKey(Chatbot, on_delete=models.CASCADE, related_name="conversations")
+    lead = models.ForeignKey(
+    "leads.Lead",
+    null=True,
+    blank=True,
+    on_delete=models.SET_NULL,
+    related_name="conversations",
+)
+
 
     # Public identity (browser/user)
     external_user_id = models.CharField(max_length=128, blank=True, default="")

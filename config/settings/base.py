@@ -26,6 +26,13 @@ INSTALLED_APPS = [
     "core.flags",
     "core.search",
     "core.knowledge",
+    "core.common",
+    "core.chatbots",
+    "core.api_keys",
+    "core.conversations",
+    "core.leads.apps.LeadsConfig",
+    "core.public",
+    "core.analytics",
 ]
 
 MIDDLEWARE = [
@@ -91,9 +98,13 @@ SPECTACULAR_SETTINGS = {"TITLE": "ChatbotBuilder API", "VERSION": "0.0.0-sprint0
 
 TENANT_HEADER = os.getenv("TENANT_HEADER", "X-Tenant-Id")
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+# Redis (used for rate limiting)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://127.0.0.1:9200")
 OPENSEARCH_INDEX_PREFIX = os.getenv("OPENSEARCH_INDEX_PREFIX", "chatbuilder")
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "http://localhost:9200")
+OPENSEARCH_KB_INDEX = os.getenv("OPENSEARCH_KB_INDEX", "kb_chunks_v1")
+OPENSEARCH_TIMEOUT = int(os.getenv("OPENSEARCH_TIMEOUT", "15"))
 
 # Celery
 CELERY_BROKER_URL = REDIS_URL

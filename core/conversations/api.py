@@ -11,6 +11,11 @@ from core.iam.models import TenantMembership
 from core.conversations.models import Conversation, Message
 from core.conversations.serializers import ConversationListSerializer, ConversationDetailSerializer
 
+from rest_framework import status
+
+from core.conversations.lead_serializers import LeadLiteSerializer
+from core.leads.models import Lead
+
 
 def _require_tenant_and_member(request):
     tenant_id = getattr(request, "tenant_id", None)
@@ -36,6 +41,8 @@ def _can_view_pii(member: TenantMembership) -> bool:
         TenantMembership.ROLE_ADMIN,
     )
 
+def _is_owner_admin(member: TenantMembership) -> bool:
+    return member.role in (TenantMembership.ROLE_OWNER, TenantMembership.ROLE_ADMIN)
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -260,4 +267,90 @@ def conversations_search(request):
             "items": items,
             "page": {"limit": limit, "offset": offset, "total": total},
         }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def conversation_lead_get(request, conversation_id: str):
+    """
+    GET /v1/conversations/{conversation_id}/lead
+    Requires crm_enabled (server-side gate)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "crm_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "CRM is not enabled for this tenant"}},
+            status=403,
+        )
+
+    conv = Conversation.objects.filter(id=conversation_id, tenant_id=tenant_id).select_related("lead").first()
+    if not conv:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Conversation not found"}}, status=404)
+
+    lead = conv.lead
+    return Response(
+        {
+            "conversation_id": str(conv.id),
+            "lead": LeadLiteSerializer(lead).data if lead else None,
+        },
+        status=200,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def conversation_lead_link(request, conversation_id: str):
+    """
+    POST /v1/conversations/{conversation_id}/lead/link
+    Body: { "lead_id": "<uuid|null>" }
+
+    OWNER/ADMIN only.
+    Requires crm_enabled (server-side gate)
+    """
+    tenant_id, member, err = _require_tenant_and_member(request)
+    if err:
+        return err
+
+    if not is_enabled(str(tenant_id), "crm_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "CRM is not enabled for this tenant"}},
+            status=403,
+        )
+
+    if not _is_owner_admin(member):
+        return Response(
+            {"error": {"code": "FORBIDDEN", "message": "Only owner/admin can link conversations to leads"}},
+            status=403,
+        )
+
+    conv = Conversation.objects.filter(id=conversation_id, tenant_id=tenant_id).first()
+    if not conv:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Conversation not found"}}, status=404)
+
+    lead_id = request.data.get("lead_id", None)
+
+    # Unlink
+    if lead_id in (None, "", "null"):
+        conv.lead_id = None
+        conv.save(update_fields=["lead", "updated_at"])
+        return Response({"conversation_id": str(conv.id), "lead": None}, status=200)
+
+    # Link (must belong to same tenant)
+    lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id).first()
+    if not lead:
+        return Response(
+            {"error": {"code": "NOT_FOUND", "message": "Lead not found"}},
+            status=404,
+        )
+
+    conv.lead = lead
+    conv.save(update_fields=["lead", "updated_at"])
+
+    return Response(
+        {"conversation_id": str(conv.id), "lead": LeadLiteSerializer(lead).data},
+        status=200,
     )

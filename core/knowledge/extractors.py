@@ -1,11 +1,10 @@
 import re
 import requests
 from bs4 import BeautifulSoup
+from io import BytesIO
 
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
+from pypdf import PdfReader
+from docx import Document as DocxDocument
 
 
 def normalize_text(text: str) -> str:
@@ -20,12 +19,10 @@ def extract_from_text(input_text: str) -> str:
 
 
 def extract_from_url(url: str, timeout_s: int = 20) -> str:
-    resp = requests.get(url, timeout=timeout_s, headers={"User-Agent": "chatbuilderbot/1.0"})
+    resp = requests.get(url, timeout=timeout_s, headers={"User-Agent": "chatbotbuilder/1.0"})
     resp.raise_for_status()
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # remove scripts/styles
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
@@ -33,32 +30,36 @@ def extract_from_url(url: str, timeout_s: int = 20) -> str:
     return normalize_text(text)
 
 
-def extract_from_pdf_file(path: str) -> str:
-    if PdfReader is None:
-        raise RuntimeError("pypdf not installed; cannot parse PDFs")
-
-    reader = PdfReader(path)
-    pages = []
-    for p in reader.pages:
-        pages.append(p.extract_text() or "")
+def extract_from_pdf_bytes(data: bytes) -> str:
+    reader = PdfReader(BytesIO(data))
+    pages = [(p.extract_text() or "") for p in reader.pages]
     return normalize_text(" ".join(pages))
+
+
+def extract_from_docx_bytes(data: bytes) -> str:
+    doc = DocxDocument(BytesIO(data))
+    parts = [p.text for p in doc.paragraphs if p.text]
+    return normalize_text(" ".join(parts))
+
+
+def extract_from_plaintext_bytes(data: bytes) -> str:
+    try:
+        return normalize_text(data.decode("utf-8", errors="ignore"))
+    except Exception:
+        return ""
 
 
 def chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> list[str]:
     text = normalize_text(text)
     if not text:
         return []
-
-    chunks = []
+    chunks: list[str] = []
     i = 0
     n = len(text)
-
     while i < n:
         end = min(i + max_chars, n)
-        chunk = text[i:end]
-        chunks.append(chunk)
+        chunks.append(text[i:end])
         if end == n:
             break
         i = max(0, end - overlap)
-
     return chunks

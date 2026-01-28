@@ -3,6 +3,7 @@
 from rest_framework import serializers
 from core.leads.models import Lead
 
+from core.leads.models import LeadEvent
 
 class LeadListSerializer(serializers.ModelSerializer):
     class Meta:
@@ -59,3 +60,16 @@ class LeadUpdateSerializer(serializers.Serializer):
         if "meta" in attrs and attrs["meta"] is None:
             attrs["meta"] = {}
         return attrs
+
+
+class LeadEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadEvent
+        fields = [
+            "id",
+            "type",
+            "source",
+            "actor_user_id",
+            "data_json",
+            "created_at",
+        ]

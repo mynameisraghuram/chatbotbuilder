@@ -12,7 +12,6 @@ from rest_framework import status
 
 from core.api_keys.public_auth import ChatbotKeyAuthentication
 from core.common.ratelimit import rate_limit_or_raise, RateLimitExceeded
-from core.public.serializers import PublicChatRequestSerializer
 
 from core.chatbots.models import Chatbot
 from core.conversations.models import Conversation, Message
@@ -20,6 +19,20 @@ from core.conversations.models import Conversation, Message
 from core.knowledge.readiness import tenant_knowledge_ready
 from core.knowledge.retrieval import search_knowledge_chunks
 
+import random
+from datetime import timedelta
+
+from core.leads.models import Lead, OtpVerification
+from core.tenants.models import Tenant
+from core.common.flags import is_enabled
+from core.api_keys.utils import hash_key
+
+from core.public.serializers import (
+    PublicLeadCaptureSerializer,
+    PublicOtpRequestSerializer,
+    PublicOtpConfirmSerializer,
+     PublicChatRequestSerializer,
+)
 
 def _clean_text(s: str) -> str:
     s = s or ""
@@ -134,6 +147,16 @@ def _rate_limit(request):
             headers={"Retry-After": str(e.retry_after_seconds)},
         )
     return None
+
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _norm_phone(phone: str) -> str:
+    p = (phone or "").strip()
+    # keep + and digits only
+    cleaned = "".join(ch for ch in p if ch.isdigit() or ch == "+")
+    return cleaned
 
 
 class PublicPingView(APIView):
@@ -307,3 +330,245 @@ class PublicChatView(APIView):
             payload["citations"] = citations
 
         return Response(payload, status=status.HTTP_200_OK)
+
+
+
+class PublicLeadCaptureView(APIView):
+    """
+    A7.5
+    POST /v1/public/leads
+    Header: X-Chatbot-Key
+
+    Body:
+      { "name": "...", "email": "...", "phone": "...", "conversation_id": "... optional" }
+
+    Behavior:
+      - requires email or phone
+      - links existing lead by (tenant,email) then (tenant,phone)
+      - creates lead if not found
+      - optionally links lead to conversation_id if provided
+      - respects chatbot.lead_capture_enabled
+      - CRM gated by flags: crm_enabled
+    """
+    authentication_classes = [ChatbotKeyAuthentication]
+    permission_classes = []
+
+    def post(self, request):
+        rl = _rate_limit(request)
+        if rl:
+            return rl
+
+        tenant_id = getattr(request, "public_tenant_id", None)
+        chatbot_id = getattr(request, "public_chatbot_id", None)
+
+        bot = Chatbot.objects.filter(id=chatbot_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+        if not bot or bot.status != Chatbot.Status.ACTIVE:
+            return Response(
+                {"error": {"code": "NOT_FOUND", "message": "Chatbot not found", "details": {}}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not bot.lead_capture_enabled:
+            return Response(
+                {"error": {"code": "FEATURE_DISABLED", "message": "Lead capture is disabled", "details": {}}},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        s = PublicLeadCaptureSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        data = s.validated_data
+
+        name = (data.get("name") or "").strip()
+        email = _norm_email(data.get("email") or "")
+        phone = _norm_phone(data.get("phone") or "")
+
+        conv_id = data.get("conversation_id")
+
+        with transaction.atomic():
+            lead = None
+
+            if email:
+                lead = Lead.objects.select_for_update().filter(
+                    tenant_id=tenant_id, primary_email=email, deleted_at__isnull=True
+                ).order_by("created_at").first()
+
+            if not lead and phone:
+                lead = Lead.objects.select_for_update().filter(
+                    tenant_id=tenant_id, phone=phone, deleted_at__isnull=True
+                ).order_by("created_at").first()
+
+            linked_existing = bool(lead)
+
+            if not lead:
+                lead = Lead.objects.create(
+                    tenant_id=tenant_id,
+                    chatbot_id=chatbot_id,
+                    name=name,
+                    primary_email=email,
+                    phone=phone,
+                    status=Lead.Status.NEW,
+                    email_verified=False,
+                )
+            else:
+                # merge missing fields (never overwrite existing with empty)
+                changed = False
+                if name and not lead.name:
+                    lead.name = name
+                    changed = True
+                if email and not lead.primary_email:
+                    lead.primary_email = email
+                    changed = True
+                if phone and not lead.phone:
+                    lead.phone = phone
+                    changed = True
+                if changed:
+                    lead.touch()
+
+            # optionally link to conversation (if the conversation belongs to same tenant/bot)
+            if conv_id and not lead.conversation_id:
+                conv = Conversation.objects.filter(id=conv_id, tenant_id=tenant_id, chatbot_id=chatbot_id).first()
+                if conv:
+                    lead.conversation = conv
+                    lead.touch()
+
+        return Response(
+            {
+                "lead": {
+                    "id": str(lead.id),
+                    "name": lead.name,
+                    "email": lead.primary_email,
+                    "phone": lead.phone,
+                    "email_verified": bool(lead.email_verified),
+                    "status": lead.status,
+                },
+                "linked_existing": linked_existing,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class PublicLeadEmailOtpRequestView(APIView):
+    """
+    POST /v1/public/leads/{lead_id}/verify-email/request
+    Header: X-Chatbot-Key
+    Body: { "email": "..." }
+    """
+    authentication_classes = [ChatbotKeyAuthentication]
+    permission_classes = []
+
+    def post(self, request, lead_id):
+        rl = _rate_limit(request)
+        if rl:
+            return rl
+
+        tenant_id = getattr(request, "public_tenant_id", None)
+        chatbot_id = getattr(request, "public_chatbot_id", None)
+
+        s = PublicOtpRequestSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        email = _norm_email(s.validated_data["email"])
+
+        lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, chatbot_id=chatbot_id, deleted_at__isnull=True).first()
+        if not lead:
+            return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found", "details": {}}}, status=404)
+
+        # throttle: 3 per 10 minutes per lead+email
+        minute_bucket = int(time.time() // 60)
+        otp_rl_key = f"otp:request:{tenant_id}:{lead_id}:{email}:{minute_bucket}"
+        try:
+            rate_limit_or_raise(key=otp_rl_key, limit=3, window_seconds=600)
+        except RateLimitExceeded as e:
+            return Response(
+                {"error": {"code": "RATE_LIMITED", "message": "Too many OTP requests", "details": {"retry_after": e.retry_after_seconds}}},
+                status=429,
+                headers={"Retry-After": str(e.retry_after_seconds)},
+            )
+
+        otp = f"{random.randint(0, 999999):06d}"
+        otp_hash = OtpVerification.hash_otp(email, otp)
+        expires_at = timezone.now() + timedelta(minutes=5)
+
+        OtpVerification.objects.create(
+            tenant_id=tenant_id,
+            lead=lead,
+            email=email,
+            otp_hash=otp_hash,
+            expires_at=expires_at,
+        )
+
+        # NOTE: Email delivery is intentionally not implemented here.
+        # Hook Celery: enqueue an email task with (tenant_id, email, otp)
+
+        return Response({"verification": {"status": "otp_sent", "expires_in_seconds": 300}}, status=202)
+
+
+class PublicLeadEmailOtpConfirmView(APIView):
+    """
+    POST /v1/public/leads/{lead_id}/verify-email/confirm
+    Header: X-Chatbot-Key
+    Body: { "email": "...", "otp": "123456" }
+    """
+    authentication_classes = [ChatbotKeyAuthentication]
+    permission_classes = []
+
+    def post(self, request, lead_id):
+        rl = _rate_limit(request)
+        if rl:
+            return rl
+
+        tenant_id = getattr(request, "public_tenant_id", None)
+        chatbot_id = getattr(request, "public_chatbot_id", None)
+
+
+        s = PublicOtpConfirmSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        email = _norm_email(s.validated_data["email"])
+        otp = (s.validated_data["otp"] or "").strip()
+
+        lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, chatbot_id=chatbot_id, deleted_at__isnull=True).first()
+        if not lead:
+            return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found", "details": {}}}, status=404)
+
+        with transaction.atomic():
+            ov = (
+                OtpVerification.objects.select_for_update()
+                .filter(
+                    tenant_id=tenant_id,
+                    lead=lead,
+                    email=email,
+                    verified_at__isnull=True,
+                )
+                .order_by("-created_at")
+                .first()
+            )
+
+            if not ov:
+                return Response({"error": {"code": "VALIDATION_ERROR", "message": "otp_not_found", "details": {}}}, status=422)
+
+            if ov.expires_at < timezone.now():
+                return Response({"error": {"code": "VALIDATION_ERROR", "message": "otp_expired", "details": {}}}, status=422)
+
+            if ov.attempt_count >= 5:
+                return Response({"error": {"code": "VALIDATION_ERROR", "message": "otp_locked", "details": {}}}, status=422)
+
+            expected = OtpVerification.hash_otp(email, otp)
+            if expected != ov.otp_hash:
+                ov.attempt_count += 1
+                ov.save(update_fields=["attempt_count"])
+                return Response(
+                    {"error": {"code": "VALIDATION_ERROR", "message": "otp_invalid", "details": {"attempts_left": max(0, 5 - ov.attempt_count)}}},
+                    status=422,
+                )
+
+            ov.verified_at = timezone.now()
+            ov.save(update_fields=["verified_at"])
+
+            lead.primary_email = email
+            lead.email_verified = True
+            lead.verified_at = ov.verified_at
+            lead.touch()
+
+        return Response(
+            {"lead": {"id": str(lead.id), "email": lead.primary_email, "email_verified": True, "verified_at": lead.verified_at.isoformat()}},
+            status=200,
+        )

@@ -17,11 +17,11 @@ class KnowledgeSource(models.Model):
     source_type = models.CharField(max_length=16, choices=SourceType.choices)
     title = models.CharField(max_length=255, blank=True, default="")
 
-    # Only one of these should be used depending on source_type
     input_text = models.TextField(blank=True, default="")
     input_url = models.URLField(blank=True, default="")
     input_file = models.FileField(upload_to="knowledge/", blank=True, null=True)
 
+    # keep existing soft-delete mechanism
     is_active = models.BooleanField(default=True)
 
     created_at = models.DateTimeField(default=timezone.now, editable=False)
@@ -45,6 +45,15 @@ class IngestionJob(models.Model):
         SUCCEEDED = "succeeded", "Succeeded"
         FAILED = "failed", "Failed"
 
+    class Stage(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        CLEANUP = "cleanup", "Cleanup"
+        EXTRACT = "extract", "Extract"
+        CHUNK = "chunk", "Chunk"
+        INDEX = "index", "Index"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="ingestion_jobs")
     source = models.ForeignKey(KnowledgeSource, on_delete=models.CASCADE, related_name="ingestion_jobs")
@@ -53,10 +62,16 @@ class IngestionJob(models.Model):
     idempotency_key = models.CharField(max_length=80, blank=True, default="")
 
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
+
+    # progress / observability
+    stage = models.CharField(max_length=16, choices=Stage.choices, default=Stage.QUEUED)
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+
     attempts = models.PositiveIntegerField(default=0)
 
     error_code = models.CharField(max_length=64, blank=True, default="")
     error_message = models.TextField(blank=True, default="")
+    last_error_at = models.DateTimeField(blank=True, null=True)
 
     started_at = models.DateTimeField(blank=True, null=True)
     finished_at = models.DateTimeField(blank=True, null=True)

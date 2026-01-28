@@ -19,17 +19,21 @@ class KnowledgeSourceSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "tenant", "created_at", "updated_at"]
 
+
+class KnowledgeSourceCreateSerializer(serializers.Serializer):
+    # For /v1/knowledge-sources (url/text)
+    source_type = serializers.ChoiceField(choices=[KnowledgeSource.SourceType.TEXT, KnowledgeSource.SourceType.URL])
+    title = serializers.CharField(required=False, allow_blank=True)
+
+    input_text = serializers.CharField(required=False, allow_blank=True)
+    input_url = serializers.URLField(required=False, allow_blank=True)
+
     def validate(self, attrs):
-        source_type = attrs.get("source_type") or getattr(self.instance, "source_type", None)
-        if source_type == KnowledgeSource.SourceType.TEXT:
-            if not (attrs.get("input_text") or getattr(self.instance, "input_text", "")):
-                raise serializers.ValidationError("input_text is required for source_type=text")
-        if source_type == KnowledgeSource.SourceType.URL:
-            if not (attrs.get("input_url") or getattr(self.instance, "input_url", "")):
-                raise serializers.ValidationError("input_url is required for source_type=url")
-        if source_type == KnowledgeSource.SourceType.FILE:
-            if not (attrs.get("input_file") or getattr(self.instance, "input_file", None)):
-                raise serializers.ValidationError("input_file is required for source_type=file")
+        st = attrs.get("source_type")
+        if st == KnowledgeSource.SourceType.TEXT and not attrs.get("input_text"):
+            raise serializers.ValidationError({"input_text": "Required for source_type=text"})
+        if st == KnowledgeSource.SourceType.URL and not attrs.get("input_url"):
+            raise serializers.ValidationError({"input_url": "Required for source_type=url"})
         return attrs
 
 
@@ -42,12 +46,19 @@ class IngestionJobSerializer(serializers.ModelSerializer):
             "source",
             "idempotency_key",
             "status",
+            "stage",
+            "progress_percent",
             "attempts",
             "error_code",
             "error_message",
+            "last_error_at",
             "started_at",
             "finished_at",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "tenant", "status", "attempts", "error_code", "error_message", "started_at", "finished_at", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "tenant", "status", "stage", "progress_percent",
+            "attempts", "error_code", "error_message", "last_error_at",
+            "started_at", "finished_at", "created_at", "updated_at"
+        ]
