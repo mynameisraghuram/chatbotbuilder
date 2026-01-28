@@ -14,6 +14,7 @@ app.conf.imports = (
     "core.leads.tasks_sla",
     "core.leads.tasks_delivery",
     "core.webhooks.tasks",
+    "core.notifications.tasks_digest",
 )
 
 # ✅ Also allow normal autodiscovery for future apps

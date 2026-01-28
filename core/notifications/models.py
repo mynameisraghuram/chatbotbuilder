@@ -44,3 +44,27 @@ class NotificationPreference(models.Model):
     def touch(self):
         self.updated_at = timezone.now()
         self.save(update_fields=["updated_at"])
+
+
+class NotificationEvent(models.Model):
+    id = models.BigAutoField(primary_key=True)
+
+    tenant_id = models.UUIDField(db_index=True)
+    user_id = models.UUIDField(db_index=True)
+
+    type = models.CharField(max_length=100, db_index=True)
+    payload_json = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    digested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    class Meta:
+        db_table = "notification_events"
+        indexes = [
+            models.Index(fields=["tenant_id", "user_id", "digested_at", "created_at"], name="notif_evt_tu_digest_created_idx"),
+            models.Index(fields=["tenant_id", "type", "created_at"], name="notif_evt_ttype_created_idx"),
+        ]
+
+    def mark_digested(self):
+        self.digested_at = timezone.now()
+        self.save(update_fields=["digested_at"])

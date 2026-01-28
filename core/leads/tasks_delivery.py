@@ -1,10 +1,11 @@
+# backend/core/leads/tasks_delivery.py
+
 from datetime import timedelta
+
 from celery import shared_task
 from django.contrib.auth import get_user_model
-from django.utils import timezone
-
 from django.db import models
-
+from django.utils import timezone
 
 from core.common.flags import is_enabled
 from core.webhooks.emailing import send_simple_email
@@ -13,9 +14,7 @@ from core.leads.models import LeadReminder
 from core.leads.events import record_lead_event
 from core.webhooks.models import WebhookEndpoint, WebhookDelivery
 from core.webhooks.tasks import deliver_webhook_delivery
-
-from core.notifications.models import NotificationPreference
-
+from core.notifications.models import NotificationPreference, NotificationEvent
 
 User = get_user_model()
 
@@ -36,21 +35,24 @@ def _recipient_user_ids_for_lead(tenant_id, lead) -> list:
     ).values_list("user_id", flat=True)
     return list(qs)
 
+
 def _email_allowed(tenant_id, user_id) -> bool:
     pref = NotificationPreference.objects.filter(tenant_id=tenant_id, user_id=user_id).first()
     if not pref:
         return True
     return bool(pref.email_enabled)
 
+
 @shared_task
 def process_due_lead_reminders():
     now = timezone.now()
 
-    qs = LeadReminder.objects.select_related("lead").filter(
-        status=LeadReminder.Status.SCHEDULED,
-    ).filter(
-        models.Q(next_attempt_at__isnull=True) | models.Q(next_attempt_at__lte=now)
-    ).order_by("created_at")[:200]
+    qs = (
+        LeadReminder.objects.select_related("lead")
+        .filter(status=LeadReminder.Status.SCHEDULED)
+        .filter(models.Q(next_attempt_at__isnull=True) | models.Q(next_attempt_at__lte=now))
+        .order_by("created_at")[:200]
+    )
 
     for r in qs:
         deliver_lead_reminder.delay(int(r.id))
@@ -83,11 +85,15 @@ def deliver_lead_reminder(self, reminder_id: int):
     any_sent = False
     last_err = None
 
-    # EMAIL
+    # EMAIL (respects NotificationPreference.email_enabled)
     for u in users:
+        if not _email_allowed(tenant_id, u.id):
+            continue
+
         email = (getattr(u, "email", "") or "").strip()
         if not email:
             continue
+
         try:
             subject = "Lead follow-up reminder"
             body = (
@@ -102,18 +108,26 @@ def deliver_lead_reminder(self, reminder_id: int):
         except Exception as e:
             last_err = f"email error: {type(e).__name__}: {e}"
 
-    # WEBHOOKS (async per endpoint)
+    # WEBHOOKS (tenant endpoints; include recipient prefs metadata)
     if is_enabled(str(tenant_id), "webhooks_enabled"):
         endpoints = WebhookEndpoint.objects.filter(tenant_id=tenant_id, is_active=True)
         payload = {
             "lead_id": str(lead.id),
             "reminder_id": str(r.id),
-            "assigned_to_user_id": str(lead.assigned_to_user_id) if getattr(lead, "assigned_to_user_id", None) else None,
+            "assigned_to_user_id": str(lead.assigned_to_user_id)
+            if getattr(lead, "assigned_to_user_id", None)
+            else None,
             "scheduled_for": r.scheduled_for.isoformat(),
+            "recipients": [
+                {"user_id": str(u.id), "email_enabled": _email_allowed(tenant_id, u.id)}
+                for u in users
+            ],
         }
+
         for ep in endpoints:
             if not ep.allows("lead.reminder.due"):
                 continue
+
             d = WebhookDelivery.objects.create(
                 tenant_id=tenant_id,
                 endpoint=ep,
@@ -141,6 +155,20 @@ def deliver_lead_reminder(self, reminder_id: int):
             actor_user_id=None,
             data={"reminder_id": str(r.id), "channels": ["email"]},
         )
+
+        # A7.14 — create inbox events for digest
+        for u in users:
+            NotificationEvent.objects.create(
+                tenant_id=tenant_id,
+                user_id=u.id,
+                type="lead.reminder.sent",
+                payload_json={
+                    "lead_id": str(lead.id),
+                    "lead_name": getattr(lead, "name", "") or "",
+                    "reminder_id": str(r.id),
+                },
+            )
+
         return
 
     if r.attempts >= 6:
