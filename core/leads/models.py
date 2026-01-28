@@ -36,6 +36,7 @@ class Lead(models.Model):
 
     meta_json = models.JSONField(default=dict, blank=True)
 
+    assigned_to_user_id = models.UUIDField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
     updated_at = models.DateTimeField(default=timezone.now, db_index=True)
     deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
