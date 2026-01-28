@@ -10,13 +10,14 @@ PUBLIC_PATH_PREFIXES = (
     "/api/docs/",
     "/v1/auth/login",
     "/v1/auth/refresh",
-    "/v1/public/",  # ✅ Public endpoints must not require X-Tenant-Id
+    "/v1/public/",
+    "/v1/health",   # ✅ allow both /v1/health and /v1/health/
+    "/health/",     # ✅ root health endpoint
 )
 
 class TenantScopeMiddleware:
     """
-    Sprint 0:
-    - Require X-Tenant-Id for /v1/* except auth/docs/admin/public.
+    - Require X-Tenant-Id for /v1/* except auth/docs/admin/public/health.
     - Parse UUID and attach request.tenant_id.
     - Membership checks are enforced in endpoints/permissions (server-side).
     """
