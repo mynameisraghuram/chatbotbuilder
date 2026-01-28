@@ -1,5 +1,6 @@
 # repo-root/backend/core/leads/api.py
 
+from django.db import transaction
 from django.db.models import Q
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -7,8 +8,14 @@ from rest_framework.response import Response
 
 from core.common.flags import is_enabled
 from core.iam.models import TenantMembership
-from core.leads.models import Lead
-from core.leads.serializers import LeadListSerializer, LeadDetailSerializer, LeadUpdateSerializer
+from core.leads.models import Lead, LeadEvent
+from core.leads.serializers import (
+    LeadListSerializer,
+    LeadDetailSerializer,
+    LeadUpdateSerializer,
+    LeadEventSerializer,
+)
+from core.leads.events import record_lead_event
 
 
 def _require_tenant_and_membership(request):
@@ -147,8 +154,18 @@ def leads_detail(request, lead_id: str):
     s.is_valid(raise_exception=True)
     data = s.validated_data
 
-    changed = False
+    # Snapshot BEFORE applying changes
+    before = {
+        "name": (lead.name or ""),
+        "phone": (lead.phone or ""),
+        "status": (lead.status or ""),
+        "meta_keys": sorted(list((lead.meta_json or {}).keys())),
+    }
 
+    changed = False
+    meta_patch_keys = []
+
+    # Apply changes
     if "name" in data:
         lead.name = data["name"]
         changed = True
@@ -162,10 +179,90 @@ def leads_detail(request, lead_id: str):
         changed = True
 
     if "meta" in data:
-        lead.meta_json = {**(lead.meta_json or {}), **(data["meta"] or {})}
+        patch = data.get("meta") or {}
+        if isinstance(patch, dict) and patch:
+            meta_patch_keys = sorted(list(patch.keys()))
+        lead.meta_json = {**(lead.meta_json or {}), **patch}
         changed = True
 
-    if changed:
+    if not changed:
+        # no changes requested; return current
+        return Response({"lead": LeadDetailSerializer(lead).data})
+
+    # Save + event in one transaction to avoid timeline inconsistencies
+    with transaction.atomic():
         lead.touch()
 
+        after = {
+            "name": (lead.name or ""),
+            "phone": (lead.phone or ""),
+            "status": (lead.status or ""),
+            "meta_keys": sorted(list((lead.meta_json or {}).keys())),
+        }
+
+        record_lead_event(
+            lead=lead,
+            event_type="lead.updated",
+            source="dashboard",
+            actor_user_id=request.user.id,
+            data={
+                "before": before,
+                "after": after,
+                "meta_patch_keys": meta_patch_keys,
+            },
+        )
+
     return Response({"lead": LeadDetailSerializer(lead).data})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def lead_timeline(request, lead_id: str):
+    """
+    GET /v1/leads/{lead_id}/timeline
+    Headers: Authorization: Bearer <jwt>, X-Tenant-Id: <uuid>
+
+    Query:
+      limit=<int optional, default 50, max 200>
+      offset=<int optional, default 0>
+      type=<optional exact match filter>
+    """
+    tenant_id, member, err = _require_tenant_and_membership(request)
+    if err:
+        return err
+
+    gate = _require_crm_enabled(tenant_id)
+    if gate:
+        return gate
+
+    lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not lead:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found"}}, status=404)
+
+    try:
+        limit = int(request.query_params.get("limit") or 50)
+    except Exception:
+        limit = 50
+    limit = max(1, min(200, limit))
+
+    try:
+        offset = int(request.query_params.get("offset") or 0)
+    except Exception:
+        offset = 0
+    offset = max(0, offset)
+
+    event_type = (request.query_params.get("type") or "").strip()
+
+    qs = LeadEvent.objects.filter(tenant_id=tenant_id, lead_id=lead_id).order_by("-created_at", "-id")
+    if event_type:
+        qs = qs.filter(type=event_type)
+
+    total = qs.count()
+    items = qs[offset: offset + limit]
+
+    return Response(
+        {
+            "items": LeadEventSerializer(items, many=True).data,
+            "page": {"limit": limit, "offset": offset, "total": total},
+        }
+    )

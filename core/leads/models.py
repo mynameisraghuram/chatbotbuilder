@@ -2,6 +2,8 @@ import uuid
 from django.db import models
 from django.utils import timezone
 
+import hashlib
+from django.conf import settings
 
 class Lead(models.Model):
     class Status(models.TextChoices):
@@ -13,7 +15,8 @@ class Lead(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="leads")
-    chatbot = models.ForeignKey("chatbots.Chatbot", on_delete=models.CASCADE, related_name="leads")
+    chatbot = models.ForeignKey("chatbots.Chatbot", on_delete=models.SET_NULL, null=True, blank=True, related_name="leads")
+
     conversation = models.ForeignKey(
         "conversations.Conversation",
         on_delete=models.SET_NULL,
@@ -54,3 +57,73 @@ class Lead(models.Model):
     def touch(self):
         self.updated_at = timezone.now()
         self.save(update_fields=["updated_at"])
+
+class LeadEvent(models.Model):
+    """
+    Immutable-ish event stream for a Lead.
+    Avoid updates; create new events instead.
+    """
+
+    class Source(models.TextChoices):
+        SYSTEM = "system", "System"
+        PUBLIC = "public", "Public"
+        DASHBOARD = "dashboard", "Dashboard"
+
+    id = models.BigAutoField(primary_key=True)
+
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="lead_events")
+    lead = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="events")
+
+    # who caused it (null for public/system)
+    actor_user_id = models.UUIDField(null=True, blank=True, db_index=True)
+
+    # machine-readable type
+    type = models.CharField(max_length=64, db_index=True)
+
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.SYSTEM)
+
+    # flexible payload; do not store raw secrets
+    data_json = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "lead_events"
+        indexes = [
+            models.Index(fields=["tenant", "lead", "created_at"]),
+            models.Index(fields=["tenant", "type", "created_at"]),
+        ]
+
+class OtpVerification(models.Model):
+    """
+    Stores hashed OTP only (never plaintext).
+    Used for verifying lead email via public widget flow.
+    """
+    id = models.BigAutoField(primary_key=True)
+
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="otp_verifications")
+    lead = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="otp_verifications")
+
+    email = models.EmailField(db_index=True)
+    otp_hash = models.CharField(max_length=64)
+
+    expires_at = models.DateTimeField(db_index=True)
+    attempt_count = models.PositiveIntegerField(default=0)
+
+    verified_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "otp_verifications"
+        indexes = [
+            models.Index(fields=["tenant", "lead", "created_at"]),
+            models.Index(fields=["tenant", "email", "expires_at"]),
+        ]
+
+    @staticmethod
+    def hash_otp(email: str, otp: str) -> str:
+        salt = getattr(settings, "SECRET_KEY", "dev")
+        payload = f"{email.strip().lower()}|{otp}|{salt}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
