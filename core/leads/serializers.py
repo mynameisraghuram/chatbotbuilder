@@ -94,3 +94,6 @@ class LeadNoteCreateSerializer(serializers.Serializer):
 
 class LeadNoteUpdateSerializer(serializers.Serializer):
     body = serializers.CharField(min_length=1, max_length=5000)
+
+class LeadTouchSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, max_length=500)

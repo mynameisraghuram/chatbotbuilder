@@ -16,12 +16,19 @@ from core.leads.serializers import (
     LeadDetailSerializer,
     LeadUpdateSerializer,
     LeadEventSerializer,
+    LeadTouchSerializer,
+
 )
 from core.leads.events import record_lead_event
 
 from django.utils import timezone
 from core.leads.models import LeadNote
 from core.leads.serializers import LeadNoteSerializer, LeadNoteCreateSerializer, LeadNoteUpdateSerializer
+
+from core.leads.sla import get_policy_for_tenant, compute_next_action_at
+
+
+
 
 def _require_tenant_and_membership(request):
     tenant_id = getattr(request, "tenant_id", None)
@@ -410,3 +417,68 @@ def lead_note_detail(request, lead_id: str, note_id: str):
         )
 
     return Response({"note": LeadNoteSerializer(note).data}, status=200)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def lead_touch(request, lead_id: str):
+    """
+    POST /v1/leads/{lead_id}/touch
+    Headers: Authorization: Bearer <jwt>, X-Tenant-Id: <uuid>
+    Body: { "note": "optional" }
+    """
+    tenant_id, member, err = _require_tenant_and_membership(request)
+    if err:
+        return err
+
+    gate = _require_crm_enabled(tenant_id)
+    if gate:
+        return gate
+
+    if not is_enabled(str(tenant_id), "lead_sla_enabled"):
+        return Response(
+            {"error": {"code": "FEATURE_DISABLED", "message": "Lead SLA is not enabled for this tenant"}},
+            status=403,
+        )
+
+    # Editor+ can touch; viewer cannot
+    if not _can_edit(member):
+        return Response(
+            {"error": {"code": "FORBIDDEN", "message": "Insufficient role to touch lead"}},
+            status=403,
+        )
+
+    lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not lead:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found"}}, status=404)
+
+    s = LeadTouchSerializer(data=request.data)
+    s.is_valid(raise_exception=True)
+    note = (s.validated_data.get("note") or "").strip()
+
+    with transaction.atomic():
+        lead = Lead.objects.select_for_update().get(id=lead_id, tenant_id=tenant_id, deleted_at__isnull=True)
+
+        lead.last_contacted_at = timezone.now()
+        policy = get_policy_for_tenant(tenant_id)
+        lead.next_action_at = compute_next_action_at(lead=lead, policy=policy)
+
+        # Persist fields even if touch() only updates updated_at
+        lead.save(update_fields=["last_contacted_at", "next_action_at"])
+
+        lead.touch()
+
+        record_lead_event(
+            lead=lead,
+            event_type="lead.touched",
+            source="dashboard",
+            actor_user_id=request.user.id,
+            data={
+                "note": note or None,
+                "last_contacted_at": lead.last_contacted_at.isoformat() if lead.last_contacted_at else None,
+                "next_action_at": lead.next_action_at.isoformat() if lead.next_action_at else None,
+            },
+        )
+
+    # ALWAYS return a Response
+    return Response({"lead": LeadDetailSerializer(lead).data}, status=200)
