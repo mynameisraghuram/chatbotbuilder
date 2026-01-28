@@ -11,6 +11,9 @@ app.conf.imports = (
     "core.common.tasks",
     "core.search.tasks",
     "core.knowledge.tasks",
+    "core.leads.tasks_sla",
+    "core.leads.tasks_delivery",
+    "core.webhooks.tasks",
 )
 
 # ✅ Also allow normal autodiscovery for future apps

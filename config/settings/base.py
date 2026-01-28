@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "core.leads.apps.LeadsConfig",
     "core.public",
     "core.analytics",
+    "core.webhooks",
 ]
 
 MIDDLEWARE = [
@@ -125,3 +126,13 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 300.0,
     },
 }
+
+
+EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "no-reply@chatbotbuilder.local")
+
+EMAIL_HOST = os.getenv("EMAIL_HOST", "localhost")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "25"))
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "0") == "1"
