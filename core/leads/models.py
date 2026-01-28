@@ -94,6 +94,37 @@ class LeadEvent(models.Model):
             models.Index(fields=["tenant", "type", "created_at"]),
         ]
 
+
+
+class LeadNote(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="lead_notes")
+    lead = models.ForeignKey("leads.Lead", on_delete=models.CASCADE, related_name="notes")
+
+    body = models.TextField()
+
+    created_by_user_id = models.UUIDField(db_index=True)
+    updated_by_user_id = models.UUIDField(null=True, blank=True, db_index=True)
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    class Meta:
+        db_table = "lead_notes"
+        indexes = [
+            models.Index(fields=["tenant", "lead", "created_at"]),
+            models.Index(fields=["tenant", "lead", "deleted_at"]),
+        ]
+
+    def soft_delete(self):
+        now = timezone.now()
+        self.deleted_at = now
+        self.updated_at = now
+        self.save(update_fields=["deleted_at", "updated_at"])
+
 class OtpVerification(models.Model):
     """
     Stores hashed OTP only (never plaintext).

@@ -1,6 +1,8 @@
 # repo-root/backend/core/leads/api.py
 
+import uuid
 from django.db import transaction
+
 from django.db.models import Q
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -17,6 +19,9 @@ from core.leads.serializers import (
 )
 from core.leads.events import record_lead_event
 
+from django.utils import timezone
+from core.leads.models import LeadNote
+from core.leads.serializers import LeadNoteSerializer, LeadNoteCreateSerializer, LeadNoteUpdateSerializer
 
 def _require_tenant_and_membership(request):
     tenant_id = getattr(request, "tenant_id", None)
@@ -52,6 +57,9 @@ def _can_edit(member: TenantMembership) -> bool:
         TenantMembership.ROLE_EDITOR,
     )
 
+def _note_snippet(text: str, n: int = 120) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    return t[:n]
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -266,3 +274,139 @@ def lead_timeline(request, lead_id: str):
             "page": {"limit": limit, "offset": offset, "total": total},
         }
     )
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def lead_notes(request, lead_id: str):
+    """
+    GET  /v1/leads/{lead_id}/notes
+    POST /v1/leads/{lead_id}/notes
+    Headers: Authorization: Bearer <jwt>, X-Tenant-Id: <uuid>
+    """
+    tenant_id, member, err = _require_tenant_and_membership(request)
+    if err:
+        return err
+
+    gate = _require_crm_enabled(tenant_id)
+    if gate:
+        return gate
+
+    lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not lead:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found"}}, status=404)
+
+    if request.method == "GET":
+        qs = (
+            LeadNote.objects.filter(tenant_id=tenant_id, lead_id=lead_id, deleted_at__isnull=True)
+            .order_by("-created_at")
+        )
+        return Response({"items": LeadNoteSerializer(qs, many=True).data})
+
+    # POST
+    if not _can_edit(member):
+        return Response(
+            {"error": {"code": "FORBIDDEN", "message": "Insufficient role to create note"}},
+            status=403,
+        )
+
+    s = LeadNoteCreateSerializer(data=request.data)
+    s.is_valid(raise_exception=True)
+    body = s.validated_data["body"]
+
+    with transaction.atomic():
+        note = LeadNote.objects.create(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            lead_id=lead_id,
+            body=body,
+            created_by_user_id=request.user.id,
+            updated_by_user_id=None,
+        )
+
+        record_lead_event(
+            lead=lead,
+            event_type="lead.note.created",
+            source="dashboard",
+            actor_user_id=request.user.id,
+            data={
+                "note_id": str(note.id),
+                "snippet": _note_snippet(note.body),
+            },
+        )
+
+    return Response({"note": LeadNoteSerializer(note).data}, status=201)
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def lead_note_detail(request, lead_id: str, note_id: str):
+    """
+    PATCH  /v1/leads/{lead_id}/notes/{note_id}
+    DELETE /v1/leads/{lead_id}/notes/{note_id}
+    """
+    tenant_id, member, err = _require_tenant_and_membership(request)
+    if err:
+        return err
+
+    gate = _require_crm_enabled(tenant_id)
+    if gate:
+        return gate
+
+    lead = Lead.objects.filter(id=lead_id, tenant_id=tenant_id, deleted_at__isnull=True).first()
+    if not lead:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Lead not found"}}, status=404)
+
+    note = LeadNote.objects.filter(
+        id=note_id, tenant_id=tenant_id, lead_id=lead_id, deleted_at__isnull=True
+    ).first()
+    if not note:
+        return Response({"error": {"code": "NOT_FOUND", "message": "Note not found"}}, status=404)
+
+    if not _can_edit(member):
+        return Response(
+            {"error": {"code": "FORBIDDEN", "message": "Insufficient role to modify note"}},
+            status=403,
+        )
+
+    if request.method == "DELETE":
+        with transaction.atomic():
+            note.soft_delete()
+
+            record_lead_event(
+                lead=lead,
+                event_type="lead.note.deleted",
+                source="dashboard",
+                actor_user_id=request.user.id,
+                data={
+                    "note_id": str(note.id),
+                    "snippet": _note_snippet(note.body),
+                },
+            )
+        return Response(status=204)
+
+    # PATCH
+    s = LeadNoteUpdateSerializer(data=request.data)
+    s.is_valid(raise_exception=True)
+
+    before = note.body
+    after = s.validated_data["body"]
+
+    with transaction.atomic():
+        note.body = after
+        note.updated_by_user_id = request.user.id
+        note.updated_at = timezone.now()
+        note.save(update_fields=["body", "updated_by_user_id", "updated_at"])
+
+        record_lead_event(
+            lead=lead,
+            event_type="lead.note.updated",
+            source="dashboard",
+            actor_user_id=request.user.id,
+            data={
+                "note_id": str(note.id),
+                "before_snippet": _note_snippet(before),
+                "after_snippet": _note_snippet(after),
+            },
+        )
+
+    return Response({"note": LeadNoteSerializer(note).data}, status=200)

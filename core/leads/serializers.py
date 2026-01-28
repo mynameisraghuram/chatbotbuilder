@@ -3,7 +3,7 @@
 from rest_framework import serializers
 from core.leads.models import Lead
 
-from core.leads.models import LeadEvent
+from core.leads.models import LeadEvent, LeadNote
 
 class LeadListSerializer(serializers.ModelSerializer):
     class Meta:
@@ -73,3 +73,24 @@ class LeadEventSerializer(serializers.ModelSerializer):
             "data_json",
             "created_at",
         ]
+
+
+class LeadNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadNote
+        fields = [
+            "id",
+            "body",
+            "created_by_user_id",
+            "updated_by_user_id",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class LeadNoteCreateSerializer(serializers.Serializer):
+    body = serializers.CharField(min_length=1, max_length=5000)
+
+
+class LeadNoteUpdateSerializer(serializers.Serializer):
+    body = serializers.CharField(min_length=1, max_length=5000)
